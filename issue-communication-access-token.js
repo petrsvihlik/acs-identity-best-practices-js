@@ -13,6 +13,7 @@ const HOSTNAME = process.env.HOST || 'localhost';
 const PORT = process.env.PORT || 80;
 const HOST_URI = `http://${HOSTNAME}:${PORT}`;
 const COMMUNICATION_SERVICES_CONNECTION_STRING = process.env.COMMUNICATION_SERVICES_CONNECTION_STRING;
+const AAD_USER = process.env.AAD_USER;
 
 // msal config
 const msalConfig = {
@@ -24,9 +25,6 @@ const msalConfig = {
 
 const pca = new PublicClientApplication(msalConfig);
 const provider = new CryptoProvider();
-
-// Instantiate the identity client
-const identityClient = new CommunicationIdentityClient(COMMUNICATION_SERVICES_CONNECTION_STRING);
 
 const app = express();
 app.use(express.json());
@@ -55,7 +53,6 @@ app.get('/cte', async (req, res) => {
 });
 
 app.get('/redirect', async (req, res) => {
-    console.log("redirected");
     const tokenRequest = {
         code: req.query.code,
         scopes: ["https://auth.msft.communication.azure.com/Teams.ManageCalls"],
@@ -64,22 +61,22 @@ app.get('/redirect', async (req, res) => {
     };
 
     pca.acquireTokenByCode(tokenRequest).then(async (response) => {
-        console.log("Response:", response);
-        let teamsToken = response.accessToken;
-        let accessToken = await identityClient.getTokenForTeamsUser(teamsToken);
-
-        console.log("CTE token:", accessToken);
+        const tokenResponse = await fetch(`${HOST_URI}/getTokenForTeamsUser`,
+            {
+                method: "POST",
+                body: JSON.stringify({ teamsToken: response.accessToken }),
+                headers: { 'Content-Type': 'application/json' }
+            });
+        const initialToken = (await tokenResponse.json()).communicationIdentityToken;
 
         const tokenCredential = new AzureCommunicationTokenCredential({
-            tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUserCTE(abortSignal, "petr@svihlik.onmicrosoft.com"),
+            tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUserCTE(abortSignal, AAD_USER),
             refreshProactively: true,
-            token: null
+            token: initialToken
         });
 
         const controller = new AbortController();
         let tkn = (await tokenCredential.getToken({ abortSignal: controller.signal }));
-        console.log(tkn.token);
-
         res.send(tkn).sendStatus(200);
     }).catch((error) => {
         console.log(error);
@@ -88,9 +85,8 @@ app.get('/redirect', async (req, res) => {
 });
 
 app.get('/standard', async (req, res) => {
-
     const tokenCredential = new AzureCommunicationTokenCredential({
-        tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUser(abortSignal, "petr@svihlik.onmicrosoft.com"),
+        tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUser(abortSignal, AAD_USER),
         refreshProactively: true,
         token: null
     });
@@ -99,21 +95,25 @@ app.get('/standard', async (req, res) => {
     let tkn = (await tokenCredential.getToken({ abortSignal: controller.signal }));
     res.send(tkn).status(200);
 });
+
+/*** SERVER */
 app.post('/getToken', async (req, res) => {
     let username = req.body.username;
     // Process the username
+    const identityClient = new CommunicationIdentityClient(COMMUNICATION_SERVICES_CONNECTION_STRING);
     let communicationIdentityToken = await identityClient.createUserAndToken(["chat"]);
     res.json({ communicationIdentityToken: communicationIdentityToken.token });
 });
 
 app.post('/getTokenForTeamsUser', async (req, res) => {
+    const identityClient = new CommunicationIdentityClient(COMMUNICATION_SERVICES_CONNECTION_STRING);
     let communicationIdentityToken = await identityClient.getTokenForTeamsUser(req.body.teamsToken);
     res.json({ communicationIdentityToken: communicationIdentityToken.token });
 });
+/*** SERVER */
 
 const refreshAadToken = async function (account, forceRefresh) {
     const renewRequest = {
-        //scopes: ["Teams.ManageCalls"],
         scopes: ["https://auth.msft.communication.azure.com/Teams.ManageCalls"],
         account: account,
         forceRefresh: forceRefresh
@@ -139,16 +139,14 @@ const refreshAadToken = async function (account, forceRefresh) {
 }
 
 const fetchTokenFromMyServerForUser = async function (abortSignal, username) {
-
     try {
-        var options = {
-            method: "POST",
-            body: JSON.stringify({ username: username }),
-            signal: abortSignal,
-            headers: { 'Content-Type': 'application/json' }
-        };
-        console.log("getTokenForUser function is being called")
-        const response = await fetch(`${HOST_URI}/getToken`, options);
+        const response = await fetch(`${HOST_URI}/getToken`,
+            {
+                method: "POST",
+                body: JSON.stringify({ username: username }),
+                signal: abortSignal,
+                headers: { 'Content-Type': 'application/json' }
+            });
 
         if (response.ok) {
             const data = await response.json();
@@ -169,14 +167,13 @@ const fetchTokenFromMyServerForUserCTE = async function (abortSignal, username) 
     var teamsToken = teamsTokenResponse.accessToken;
 
     try {
-        var options = {
-            method: "POST",
-            body: JSON.stringify({ teamsToken: teamsToken }),
-            signal: abortSignal,
-            headers: { 'Content-Type': 'application/json' }
-        };
-        console.log("getTokenForUser function is being called")
-        const response = await fetch(`${HOST_URI}/getTokenForTeamsUser`, options);
+        const response = await fetch(`${HOST_URI}/getTokenForTeamsUser`,
+            {
+                method: "POST",
+                body: JSON.stringify({ teamsToken: teamsToken }),
+                signal: abortSignal,
+                headers: { 'Content-Type': 'application/json' }
+            });
 
         if (response.ok) {
             const data = await response.json();
