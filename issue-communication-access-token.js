@@ -23,7 +23,7 @@ const msalConfig = {
     }
 };
 
-const pca = new PublicClientApplication(msalConfig);
+const publicClientApplication = new PublicClientApplication(msalConfig);
 const provider = new CryptoProvider();
 
 const app = express();
@@ -47,7 +47,7 @@ app.get('/cte', async (req, res) => {
         codeChallengeMethod: "S256" // PKCE Code Challenge Method 
     };
 
-    pca.getAuthCodeUrl(authCodeUrlParameters).then((response) => {
+    publicClientApplication.getAuthCodeUrl(authCodeUrlParameters).then((response) => {
         res.redirect(response);
     }).catch((error) => console.log(JSON.stringify(error)));
 });
@@ -60,7 +60,7 @@ app.get('/redirect', async (req, res) => {
         codeVerifier: pkceVerifier,
     };
 
-    pca.acquireTokenByCode(tokenRequest).then(async (response) => {
+    publicClientApplication.acquireTokenByCode(tokenRequest).then(async (response) => {
         const tokenResponse = await fetch(`${HOST_URI}/getTokenForTeamsUser`,
             {
                 method: "POST",
@@ -72,7 +72,7 @@ app.get('/redirect', async (req, res) => {
         const tokenCredential = new AzureCommunicationTokenCredential({
             tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUserCTE(abortSignal, AAD_USER),
             refreshProactively: true,
-            token: initialToken
+            // token: initialToken
         });
 
         const controller = new AbortController();
@@ -86,7 +86,7 @@ app.get('/redirect', async (req, res) => {
 
 app.get('/standard', async (req, res) => {
     const tokenCredential = new AzureCommunicationTokenCredential({
-        tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUser(abortSignal, AAD_USER),
+        tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUser(abortSignal),
         refreshProactively: true,
         token: null
     });
@@ -98,10 +98,11 @@ app.get('/standard', async (req, res) => {
 
 /*** SERVER */
 app.post('/getToken', async (req, res) => {
-    let username = req.body.username;
-    // Process the username
+    // Custom logic to determine the communication user id
+    let userId = await getCommunicationUserIdFromDb(req.body.username);
+    // Get a fresh token
     const identityClient = new CommunicationIdentityClient(COMMUNICATION_SERVICES_CONNECTION_STRING);
-    let communicationIdentityToken = await identityClient.createUserAndToken(["chat"]);
+    let communicationIdentityToken = await identityClient.getToken({ communicationUserId: userId }, ["chat", "voip"]);
     res.json({ communicationIdentityToken: communicationIdentityToken.token });
 });
 
@@ -112,19 +113,29 @@ app.post('/getTokenForTeamsUser', async (req, res) => {
 });
 /*** SERVER */
 
-const refreshAadToken = async function (account, forceRefresh) {
+const getCommunicationUserIdFromDb = async function (username) {
+    const identityClient = new CommunicationIdentityClient(COMMUNICATION_SERVICES_CONNECTION_STRING);
+    const user = await identityClient.createUser();
+    console.log(`ID of User ${username}: ${user.id}`);
+    return user.communicationUserId;
+};
+
+const refreshAadToken = async function (abortSignal, account, forceRefresh) {
+    if (abortSignal.aborted === true) throw new Error("Operation canceled");
     const renewRequest = {
         scopes: ["https://auth.msft.communication.azure.com/Teams.ManageCalls"],
         account: account,
         forceRefresh: forceRefresh
     };
     let tokenResponse = null;
-    await pca.acquireTokenSilent(renewRequest).then(renewResponse => {
+    // Try to get the token silently without the user's interaction    
+    await publicClientApplication.acquireTokenSilent(renewRequest).then(renewResponse => {
         tokenResponse = renewResponse;
     }).catch(async (error) => {
         // In case of an InteractionRequired error, send the same request in an interactive call
         if (error instanceof InteractionRequiredAuthError) {
-            pca.acquireTokenPopup(renewRequest).then(function (renewInteractiveResponse) {
+            // You can choose the popup or redirect experience (`acquireTokenPopup` or `acquireTokenRedirect` respectively)
+            publicClientApplication.acquireTokenPopup(renewRequest).then(function (renewInteractiveResponse) {
                 tokenResponse = renewInteractiveResponse;
             }).catch(function (interactiveError) {
                 console.log(interactiveError);
@@ -133,55 +144,46 @@ const refreshAadToken = async function (account, forceRefresh) {
     });
     if (tokenResponse.expiresOn < (Date.now() + (10 * 60 * 1000)) && !forceRefresh) {
         // Make sure the token has at least 10-minute lifetime and if not, force-renew it
-        tokenResponse = await refreshAadToken(teamsUser, true);
+        tokenResponse = await refreshAadToken(abortSignal, teamsUser, true);
     }
     return tokenResponse;
 }
 
 const fetchTokenFromMyServerForUser = async function (abortSignal, username) {
-    try {
-        const response = await fetch(`${HOST_URI}/getToken`,
-            {
-                method: "POST",
-                body: JSON.stringify({ username: username }),
-                signal: abortSignal,
-                headers: { 'Content-Type': 'application/json' }
-            });
+    const response = await fetch(`${HOST_URI}/getToken`,
+        {
+            method: "POST",
+            body: JSON.stringify({ username: username }),
+            signal: abortSignal,
+            headers: { 'Content-Type': 'application/json' }
+        });
 
-        if (response.ok) {
-            const data = await response.json();
-            return data.communicationIdentityToken;
-        }
-    }
-    catch (error) {
-        console.log(error);
+    if (response.ok) {
+        const data = await response.json();
+        return data.communicationIdentityToken;
     }
 };
 
 const fetchTokenFromMyServerForUserCTE = async function (abortSignal, username) {
-    // MSAL.js v2 exposes several account APIs, logic to determine which account to use is the responsibility of the developer
-    // In this case, we'll use an account from the cache
-    let teamsUser = (await pca.getTokenCache().getAllAccounts()).find(u => u.username === username);
+    // MSAL.js v2 exposes several account APIs; the logic to determine which account to use is the responsibility of the developer. 
+    // In this case, we'll use an account from the cache.    
+    let teamsUser = (await publicClientApplication.getTokenCache().getAllAccounts()).find(u => u.username === username);
 
-    let teamsTokenResponse = await refreshAadToken(teamsUser);
-    var teamsToken = teamsTokenResponse.accessToken;
+    // Get a fresh AAD token first
+    let teamsTokenResponse = await refreshAadToken(abortSignal, teamsUser);
 
-    try {
-        const response = await fetch(`${HOST_URI}/getTokenForTeamsUser`,
-            {
-                method: "POST",
-                body: JSON.stringify({ teamsToken: teamsToken }),
-                signal: abortSignal,
-                headers: { 'Content-Type': 'application/json' }
-            });
+    // Use the fresh AAD token to exchange it for a Communication Identity access token
+    const response = await fetch(`${HOST_URI}/getTokenForTeamsUser`,
+        {
+            method: "POST",
+            body: JSON.stringify({ teamsToken: teamsTokenResponse.accessToken }),
+            signal: abortSignal,
+            headers: { 'Content-Type': 'application/json' }
+        });
 
-        if (response.ok) {
-            const data = await response.json();
-            return data.communicationIdentityToken;
-        }
-    }
-    catch (error) {
-        console.log(error);
+    if (response.ok) {
+        const data = await response.json();
+        return data.communicationIdentityToken;
     }
 }
 
