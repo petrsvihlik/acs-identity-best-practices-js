@@ -18,8 +18,8 @@ const AAD_USER = process.env.AAD_USER;
 // msal config
 const msalConfig = {
     auth: {
-        clientId: process.env.CLIENT_ID,
-        authority: process.env.AUTHORITY,
+        clientId: process.env.AAD_CLIENT_ID,
+        authority: process.env.AAD_AUTHORITY,
     }
 };
 
@@ -33,7 +33,7 @@ let pkceVerifier = null;
 
 app.get('/', async (req, res) => {
     res.json({
-        standard: `${HOST_URI}/standard`, cte: `${HOST_URI}/cte`,
+        default_get_token_flow: `${HOST_URI}/default`, custom_teams_endpoint_flow: `${HOST_URI}/cte`,
     });
 });
 
@@ -72,7 +72,7 @@ app.get('/redirect', async (req, res) => {
         const tokenCredential = new AzureCommunicationTokenCredential({
             tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUserCTE(abortSignal, AAD_USER),
             refreshProactively: true,
-            // token: initialToken
+            token: initialToken
         });
 
         const controller = new AbortController();
@@ -84,7 +84,7 @@ app.get('/redirect', async (req, res) => {
     });
 });
 
-app.get('/standard', async (req, res) => {
+app.get('/default', async (req, res) => {
     const tokenCredential = new AzureCommunicationTokenCredential({
         tokenRefresher: async (abortSignal) => fetchTokenFromMyServerForUser(abortSignal),
         refreshProactively: true,
@@ -120,8 +120,13 @@ const getCommunicationUserIdFromDb = async function (username) {
     return user.communicationUserId;
 };
 
-const refreshAadToken = async function (abortSignal, account, forceRefresh) {
+const refreshAadToken = async function (abortSignal, username, forceRefresh) {
     if (abortSignal.aborted === true) throw new Error("Operation canceled");
+    
+    // MSAL.js v2 exposes several account APIs; the logic to determine which account to use is the responsibility of the developer. 
+    // In this case, we'll use an account from the cache.    
+    let account = (await publicClientApplication.getTokenCache().getAllAccounts()).find(u => u.username === username);
+
     const renewRequest = {
         scopes: ["https://auth.msft.communication.azure.com/Teams.ManageCalls"],
         account: account,
@@ -144,7 +149,7 @@ const refreshAadToken = async function (abortSignal, account, forceRefresh) {
     });
     if (tokenResponse.expiresOn < (Date.now() + (10 * 60 * 1000)) && !forceRefresh) {
         // Make sure the token has at least 10-minute lifetime and if not, force-renew it
-        tokenResponse = await refreshAadToken(abortSignal, teamsUser, true);
+        tokenResponse = await refreshAadToken(abortSignal, username, true);
     }
     return tokenResponse;
 }
@@ -165,12 +170,8 @@ const fetchTokenFromMyServerForUser = async function (abortSignal, username) {
 };
 
 const fetchTokenFromMyServerForUserCTE = async function (abortSignal, username) {
-    // MSAL.js v2 exposes several account APIs; the logic to determine which account to use is the responsibility of the developer. 
-    // In this case, we'll use an account from the cache.    
-    let teamsUser = (await publicClientApplication.getTokenCache().getAllAccounts()).find(u => u.username === username);
-
     // Get a fresh AAD token first
-    let teamsTokenResponse = await refreshAadToken(abortSignal, teamsUser);
+    let teamsTokenResponse = await refreshAadToken(abortSignal, username);
 
     // Use the fresh AAD token to exchange it for a Communication Identity access token
     const response = await fetch(`${HOST_URI}/getTokenForTeamsUser`,
