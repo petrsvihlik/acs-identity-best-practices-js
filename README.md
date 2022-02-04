@@ -18,3 +18,5 @@ AAD_USER="<name>@<domain>.<tld>"
 
 2. Run `npm install`
 3. Run `node .\issue-communication-access-token.js` or "Run Current File" in VS Code to debug
+4. Go to `localhost`
+5. Choose one of the supported flows and follow the URL
